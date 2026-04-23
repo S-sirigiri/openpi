@@ -277,3 +277,31 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_guided(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        fkc_config,
+        fkc_runtime,
+        *,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        """FKC / linear-combo / vanilla sampler.
+
+        Thin shim that delegates to ``openpi.fkc.sampling.sample_actions_guided``.
+        Exists as a method so it can be passed through ``nnx_utils.module_jit``
+        with ``fkc_config`` treated as a static argument.
+        """
+        from openpi.fkc import sampling as _fkc_sampling
+
+        return _fkc_sampling.sample_actions_guided(
+            self,
+            rng,
+            observation,
+            fkc_config,
+            fkc_runtime,
+            num_steps=num_steps,
+            noise=noise,
+        )

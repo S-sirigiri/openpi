@@ -5,6 +5,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from openpi.fkc.config import FKCConfig
+from openpi.fkc.config import load_fkc_config
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
@@ -22,6 +24,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    fkc_config: FKCConfig | str | pathlib.Path | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -72,6 +75,12 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    resolved_fkc_config: FKCConfig | None
+    if fkc_config is None or isinstance(fkc_config, FKCConfig):
+        resolved_fkc_config = fkc_config
+    else:
+        resolved_fkc_config = load_fkc_config(fkc_config)
+
     return _policy.Policy(
         model,
         transforms=[
@@ -91,4 +100,6 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+        fkc_config=resolved_fkc_config,
+        norm_stats=norm_stats,
     )

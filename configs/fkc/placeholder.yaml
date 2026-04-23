@@ -1,0 +1,69 @@
+# FKC guidance placeholder config for pi0.5 (pi05_droid_jointpos).
+#
+# Pass via the serve_policy CLI:
+#   XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 uv run scripts/serve_policy.py \
+#       policy:checkpoint \
+#       --policy.config=pi05_droid_jointpos \
+#       --policy.dir=gs://openpi-assets-simeval/pi05_droid_jointpos \
+#       --policy.fkc_config=configs/fkc/placeholder.yaml
+#
+# Change `mode` to switch between guidance schemes. When omitted (or mode:
+# vanilla) the server behaves identically to baseline pi0.5.
+
+mode: fkc  # one of: vanilla, linear_combo, fkc
+
+# Leave null to inherit from the model (pi0.5 default: 10).
+num_steps: null
+
+# Particles
+num_particles: 4          # only used in `fkc` mode
+particles_parallel: true
+
+# Scheduling hints
+parallel_nn_and_cost: true
+
+# Decoupled objective weights (the user-requested split).
+# "value" weights drive the Feynman-Kac log-weight update.
+w_cost_value: 1.0
+w_eq_value:   1.0
+w_ineq_value: 1.0
+# "grad" weights drive the augmented drift (∇J_grad).
+w_cost_grad:  1.0
+w_eq_grad:    1.0
+w_ineq_grad:  1.0
+
+# Gibbs-tilt (β_t). Sign flipped internally so strength > 0 pulls toward low cost.
+beta_schedule: constant  # constant | linear_ramp
+beta_strength: 1.0
+
+# Flow -> SDE noise injection. IMPORTANT: the drift term for linear_combo / fkc
+# is scaled by σ²/2, so sigma_schedule: zero (or sigma_scale: 0) makes both
+# guidance modes collapse back to vanilla. Match gr00t's default here: use
+# zero_ends (σ_t = α·√(t(1-t))) for a smooth schedule that peaks mid-denoise
+# and vanishes at the endpoints.
+sigma_schedule: zero_ends  # zero | constant | zero_ends
+sigma_scale: 0.25          # α in the zero_ends schedule
+
+# FKC resampling
+resample_interval: 1
+resample_t_min: 0.05
+resample_t_max: 0.95
+center_log_weight_increment: true
+
+# Forward kinematics: Franka Panda at the world origin (matches RoboLab's
+# BananaInBowlTask scene). Update if another task moves the base.
+fk:
+  robot: franka_panda
+  base_xyz: [0.0, 0.0, 0.0]
+  base_quat_xyzw: [0.0, 0.0, 0.0, 1.0]
+  ee_offset_xyz: [0.0, 0.0, 0.0]
+  ee_offset_quat_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+# Placeholder task: pull the final EE position toward this world target and
+# keep every waypoint inside a wide bounding box. Replace with the real
+# banana-in-bowl cost later.
+cost:
+  target_xyz:  [0.55, 0.0, 0.25]
+  box_min_xyz: [-1.0, -1.0, 0.0]
+  box_max_xyz: [1.0, 1.0, 1.2]
+  softplus_beta: 10.0

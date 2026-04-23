@@ -14,6 +14,9 @@ import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
+from openpi.fkc import cost_constraint as _fkc_cc
+from openpi.fkc import fk as _fkc_fk
+from openpi.fkc.config import FKCConfig
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
@@ -33,6 +36,8 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        fkc_config: FKCConfig | None = None,
+        norm_stats: dict[str, _transforms.NormStats] | None = None,
     ):
         """Initialize the Policy.
 
@@ -46,6 +51,11 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+            fkc_config: Optional FKC guidance config. If given and not
+                ``mode=="vanilla"``, inference routes through the guided sampler.
+                Only supported on the JAX path.
+            norm_stats: Normalization statistics. Required alongside ``fkc_config``
+                so the guided sampler can un-normalize joint states for FK.
         """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -54,14 +64,31 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._fkc_config = fkc_config
+        self._fkc_active = fkc_config is not None and fkc_config.mode != "vanilla"
 
         if self._is_pytorch_model:
+            if self._fkc_active:
+                raise NotImplementedError("FKC guidance is only implemented for the JAX inference path.")
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            if self._fkc_active:
+                if norm_stats is None or "state" not in norm_stats or "actions" not in norm_stats:
+                    raise ValueError(
+                        "FKC guidance requires 'state' and 'actions' entries in norm_stats so "
+                        "joint positions can be un-normalized for forward kinematics."
+                    )
+                self._fkc_static_runtime_parts = self._build_fkc_static_runtime(fkc_config, norm_stats)
+                self._resolved_num_steps = int(fkc_config.num_steps) if fkc_config.num_steps is not None else 10
+                self._sample_actions = nnx_utils.module_jit(
+                    model.sample_actions_guided,
+                    static_argnames=("fkc_config", "num_steps"),
+                )
+            else:
+                self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -89,6 +116,11 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        if self._fkc_active:
+            sample_kwargs = dict(sample_kwargs)
+            sample_kwargs["fkc_config"] = self._fkc_config
+            sample_kwargs["fkc_runtime"] = self._materialise_fkc_runtime(observation)
+            sample_kwargs["num_steps"] = self._resolved_num_steps
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
@@ -108,6 +140,47 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    def _build_fkc_static_runtime(
+        self, fkc_config: FKCConfig, norm_stats: dict[str, _transforms.NormStats]
+    ) -> dict[str, jnp.ndarray]:
+        """Pre-compute the FK + normalization tensors that don't change across infer calls."""
+        action_stats = norm_stats["actions"]
+        state_stats = norm_stats["state"]
+        action_mean_7 = jnp.asarray(action_stats.mean[:7], dtype=jnp.float32)
+        action_std_7 = jnp.asarray(action_stats.std[:7], dtype=jnp.float32)
+        state_mean_7 = jnp.asarray(state_stats.mean[:7], dtype=jnp.float32)
+        state_std_7 = jnp.asarray(state_stats.std[:7], dtype=jnp.float32)
+        base_world_T, ee_offset_T = _fkc_fk.build_fk_transforms(fkc_config.fk)
+        return {
+            "action_mean_7": action_mean_7,
+            "action_std_7": action_std_7,
+            "state_mean_7": state_mean_7,
+            "state_std_7": state_std_7,
+            "base_world_T": base_world_T,
+            "ee_offset_T": ee_offset_T,
+            "target_xyz": jnp.asarray(fkc_config.cost.target_xyz, dtype=jnp.float32),
+            "box_min_xyz": jnp.asarray(fkc_config.cost.box_min_xyz, dtype=jnp.float32),
+            "box_max_xyz": jnp.asarray(fkc_config.cost.box_max_xyz, dtype=jnp.float32),
+            "softplus_beta": jnp.asarray(fkc_config.cost.softplus_beta, dtype=jnp.float32),
+        }
+
+    def _materialise_fkc_runtime(self, observation: _model.Observation) -> _fkc_cc.FKRuntime:
+        """Build the per-infer ``FKRuntime`` (un-normalizes the current joint state)."""
+        static = self._fkc_static_runtime_parts
+        norm_state_7 = observation.state[..., :7]
+        abs_joint_pos = norm_state_7 * (static["state_std_7"] + 1e-6) + static["state_mean_7"]
+        return _fkc_cc.FKRuntime(
+            action_mean_7=static["action_mean_7"],
+            action_std_7=static["action_std_7"],
+            current_joint_pos=abs_joint_pos,
+            base_world_T=static["base_world_T"],
+            ee_offset_T=static["ee_offset_T"],
+            target_xyz=static["target_xyz"],
+            box_min_xyz=static["box_min_xyz"],
+            box_max_xyz=static["box_max_xyz"],
+            softplus_beta=static["softplus_beta"],
+        )
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

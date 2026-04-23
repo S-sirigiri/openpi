@@ -29,6 +29,10 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Optional path to an FKC guidance YAML config. When omitted (or mode=vanilla
+    # inside the YAML), inference runs unchanged. Only wired up for the JAX
+    # path today.
+    fkc_config: str | None = None
 
 
 @dataclasses.dataclass
@@ -95,7 +99,10 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                fkc_config=args.policy.fkc_config,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
