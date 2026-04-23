@@ -24,17 +24,17 @@ parallel_nn_and_cost: true
 
 # Decoupled objective weights (the user-requested split).
 # "value" weights drive the Feynman-Kac log-weight update.
-w_cost_value: 1.0
-w_eq_value:   1.0
-w_ineq_value: 1.0
+w_cost_value: 0.0
+w_eq_value:   0.0
+w_ineq_value: 1000.0
 # "grad" weights drive the augmented drift (∇J_grad).
-w_cost_grad:  1.0
-w_eq_grad:    1.0
-w_ineq_grad:  1.0
+w_cost_grad:  0.0
+w_eq_grad:    0.0
+w_ineq_grad:  1000.0
 
 # Gibbs-tilt (β_t). Sign flipped internally so strength > 0 pulls toward low cost.
 beta_schedule: constant  # constant | linear_ramp
-beta_strength: 1.0
+beta_strength: 100000.0
 
 # Flow -> SDE noise injection. IMPORTANT: the drift term for linear_combo / fkc
 # is scaled by σ²/2, so sigma_schedule: zero (or sigma_scale: 0) makes both

@@ -114,17 +114,34 @@ class FKCConfig:
 
     # --- Stochasticity (flow → SDE, cf. Stochastic Sampling paper) -----------
     # ``zero`` keeps the integrator deterministic, matching vanilla pi0.5.
-    # ``constant`` / ``zero_ends`` inject Brownian noise at every step, letting
-    # FKC re-sample around the posterior mode rather than collapsing to a single
-    # point.
-    sigma_schedule: Literal["zero", "constant", "zero_ends"] = "zero"
+    # ``constant`` / ``zero_ends`` / ``non_singular`` inject Brownian noise at
+    # every step, letting FKC re-sample around the posterior mode rather than
+    # collapsing to a single point. ``non_singular`` is Table 1 of Singh &
+    # Fischer 2024 (σ_t = α·√t in pi0's t=1-is-noise convention) and was their
+    # best-performing ImageNet schedule — high noise at the noise end, zero at
+    # the data end.
+    sigma_schedule: Literal["zero", "constant", "zero_ends", "non_singular"] = "zero"
     sigma_scale: float = 0.0
+
+    # --- Flow-source (prior) distribution ------------------------------------
+    # Parameters (mean, variance) of p_{t=1} — the prior that x_t converges to
+    # at pure noise. pi0.5 uses N(0, I), so the defaults keep the sampler
+    # identical to unguided pi0.5 when FKC is off. Plugged into Singh & Fischer
+    # 2024 Eq. 13 to derive the score from the flow velocity.
+    flow_source_mean: float = 0.0
+    flow_source_variance: float = 1.0
 
     # --- Resampling (fkc mode only) ------------------------------------------
     resample_interval: int = 1
     resample_t_min: float = 0.05
     resample_t_max: float = 0.95
     center_log_weight_increment: bool = True
+    # When True, batch rows with non-finite / zero-sum log-weights are replaced
+    # by a uniform distribution in ``_systematic_resample`` and
+    # ``_sample_final_particle``, and a warning is printed. Guards against
+    # numerical blow-up when β is large or J explodes. Turn off to get raw
+    # (potentially NaN) behavior.
+    handle_invalid_weights: bool = True
 
     # --- Sub-configs ---------------------------------------------------------
     fk: FKConfig = dataclasses.field(default_factory=FKConfig)

@@ -35,8 +35,8 @@ Decoupled weights (the user-requested change from gr00t):
 
 Note on σ=0: for linear_combo and fkc modes, the entire gradient contribution
 is scaled by σ²/2, so σ_schedule=``zero`` makes guidance vanish. To get
-meaningful guidance, set ``sigma_schedule: zero_ends`` (or ``constant``) with
-``sigma_scale > 0`` in the YAML.
+meaningful guidance, set ``sigma_schedule`` to ``zero_ends``, ``constant``, or
+``non_singular`` (Singh & Fischer Table 1) with ``sigma_scale > 0`` in the YAML.
 """
 
 from __future__ import annotations
@@ -82,6 +82,12 @@ def sigma_value(time: jnp.ndarray, fkc_config: FKCConfig) -> jnp.ndarray:
         return scale
     if fkc_config.sigma_schedule == "zero_ends":
         return scale * jnp.sqrt(jnp.clip(time * (1.0 - time), 0.0, None))
+    if fkc_config.sigma_schedule == "non_singular":
+        # NonSingular from Singh & Fischer 2024 Table 1: σ_t = α·√t in their
+        # t-convention where t=1 is the source noise. pi0.5 shares that
+        # convention, so the schedule maps over directly (peaks at pure noise,
+        # zero at clean data). This is the mirror of gr00t's α·√(1 - t_cont).
+        return scale * jnp.sqrt(jnp.clip(time, 0.0, None))
     raise ValueError(f"unknown sigma_schedule: {fkc_config.sigma_schedule}")
 
 
@@ -89,25 +95,31 @@ def score_from_velocity(
     x_t: jnp.ndarray,
     v_t: jnp.ndarray,
     time: jnp.ndarray,
+    *,
+    source_mean: float | jnp.ndarray = 0.0,
+    source_variance: float | jnp.ndarray = 1.0,
     eps: float = 1.0e-6,
 ) -> jnp.ndarray:
     """Score ∇log p_t(x_t) derived from the flow-matching velocity.
 
     pi0.5 convention: ``x_t = t·noise + (1-t)·actions`` with ``v = noise - actions``
-    and ``t: 1 → 0``. Tweedie's formula then gives
+    and ``t: 1 → 0``. Parametrising the prior p_{t=1} as N(μ, σ² I), Singh &
+    Fischer 2024 Eq. 13 gives
 
-        E[noise | x_t] = x_t + (1-t)·v_t
-        ∇log p_t(x_t)  = -E[noise | x_t] / t = -(x_t + (1-t)·v_t) / t
+        ∇log p_t(x_t) = (μ - x_t - (1-t)·v_t) / (t · σ²)
 
-    Sanity: at t=1 (pure Gaussian noise), score = -x_t, which is ∇log N(0, I). ✓
+    The defaults ``μ=0, σ²=1`` recover pi0.5's standard-normal prior and the
+    familiar ``-(x_t + (1-t)·v_t) / t``.
+
+    Sanity: at t=1 (pure prior), score = (μ - x_t)/σ², which is ∇log N(μ, σ²I). ✓
     Diverges at t=0 (clean data); the sampling loop stops before reaching t=0.
 
     This is the openpi-time-convention mirror of gr00t's
-    ``_score_from_velocity`` (which uses (t·v - x)/(1-t) for its flipped time
-    convention).
+    ``_score_from_velocity`` (which uses (t·v + μ - x)/((1-t)·σ²) for its
+    flipped time convention).
     """
-    denom = jnp.maximum(time, eps)
-    return -(x_t + (1.0 - time) * v_t) / denom
+    denom = jnp.maximum(time, eps) * source_variance
+    return (source_mean - x_t - (1.0 - time) * v_t) / denom
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +127,47 @@ def score_from_velocity(
 # ---------------------------------------------------------------------------
 
 
-def _systematic_resample(log_weights: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
-    """Systematic (low-variance) resampling. Returns (B, K) int32 indices."""
+def _warn_invalid(count: jnp.ndarray, where: str) -> None:
+    """Emit a one-line warning when a batch row's weights are degenerate.
+
+    ``jax.lax.cond`` + ``jax.debug.print`` keeps this JIT-safe: the print
+    callback fires on the host only when ``count > 0``.
+    """
+    def _emit(c):
+        jax.debug.print(
+            "[FKC] {where}: {c} batch item(s) had degenerate weights; falling back to uniform.",
+            where=where,
+            c=c,
+        )
+
+    def _noop(_c):
+        return None
+
+    jax.lax.cond(count > 0, _emit, _noop, count)
+
+
+def _systematic_resample(
+    log_weights: jnp.ndarray,
+    rng: jax.Array,
+    handle_invalid: bool,
+) -> jnp.ndarray:
+    """Systematic (low-variance) resampling. Returns (B, K) int32 indices.
+
+    When ``handle_invalid`` is True, batch rows whose post-softmax weights are
+    non-finite or sum to zero are replaced by a uniform distribution and a
+    warning is printed (matches gr00t's robustness fallback). When False, bad
+    weights propagate silently.
+    """
     b, k = log_weights.shape
     shifted = log_weights - jnp.max(log_weights, axis=1, keepdims=True)
     weights = jax.nn.softmax(shifted, axis=1)
+
+    if handle_invalid:
+        invalid = jnp.any(~jnp.isfinite(weights), axis=1) | (jnp.sum(weights, axis=1) <= 0)
+        _warn_invalid(jnp.sum(invalid.astype(jnp.int32)), where="systematic_resample")
+        uniform = jnp.full_like(weights, 1.0 / k)
+        weights = jnp.where(invalid[:, None], uniform, weights)
+
     cdf = jnp.cumsum(weights, axis=1)
     cdf = cdf.at[:, -1].set(1.0)
 
@@ -144,9 +192,23 @@ def _gather_particles(actions: jnp.ndarray, indices: jnp.ndarray, batch_size: in
     return gathered.reshape(b * k, *actions.shape[1:])
 
 
-def _sample_final_particle(log_weights: jnp.ndarray, rng: jax.Array) -> jnp.ndarray:
-    """Draw one particle per batch item by multinomial over final weights."""
-    shifted = log_weights - jnp.max(log_weights, axis=1, keepdims=True)
+def _sample_final_particle(
+    log_weights: jnp.ndarray,
+    rng: jax.Array,
+    handle_invalid: bool,
+) -> jnp.ndarray:
+    """Draw one particle per batch item by multinomial over final weights.
+
+    When ``handle_invalid`` is True, rows with non-finite log-weights are
+    replaced by zero-logits (uniform) and a warning is printed.
+    """
+    if handle_invalid:
+        invalid = jnp.any(~jnp.isfinite(log_weights), axis=1)
+        _warn_invalid(jnp.sum(invalid.astype(jnp.int32)), where="sample_final_particle")
+        safe_logw = jnp.where(invalid[:, None], jnp.zeros_like(log_weights), log_weights)
+        shifted = safe_logw - jnp.max(safe_logw, axis=1, keepdims=True)
+    else:
+        shifted = log_weights - jnp.max(log_weights, axis=1, keepdims=True)
     return jax.random.categorical(rng, shifted, axis=1).astype(jnp.int32)
 
 
@@ -297,7 +359,13 @@ def sample_actions_guided(
         if not fkc_config.parallel_nn_and_cost:
             grad_j = grad_j + 0.0 * jnp.sum(v_t)
 
-        score = score_from_velocity(x_t, v_t, t_cur_j)
+        score = score_from_velocity(
+            x_t,
+            v_t,
+            t_cur_j,
+            source_mean=fkc_config.flow_source_mean,
+            source_variance=fkc_config.flow_source_variance,
+        )
         sigma = sigma_value(t_cur_j, fkc_config)
         beta_t = beta_value(t_cur_j, fkc_config)
 
@@ -335,7 +403,9 @@ def sample_actions_guided(
                     and (step_idx + 1) < num_steps
                 )
                 if should_resample:
-                    indices = _systematic_resample(log_weights, resample_rng)
+                    indices = _systematic_resample(
+                        log_weights, resample_rng, fkc_config.handle_invalid_weights
+                    )
                     x_t = _gather_particles(x_t, indices, orig_batch_size, num_particles)
                     log_weights = jnp.zeros_like(log_weights)
 
@@ -343,7 +413,9 @@ def sample_actions_guided(
 
     if mode == "fkc" and num_particles > 1:
         rng, pick_rng = jax.random.split(rng)
-        picked = _sample_final_particle(log_weights, pick_rng)  # (B,)
+        picked = _sample_final_particle(
+            log_weights, pick_rng, fkc_config.handle_invalid_weights
+        )  # (B,)
         x_t = x_t.reshape(orig_batch_size, num_particles, *x_t.shape[1:])
         x_t = jnp.take_along_axis(x_t, picked[:, None, None, None], axis=1).squeeze(1)
 

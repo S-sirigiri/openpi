@@ -84,7 +84,15 @@ def _h_ineq(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
     violation = jnp.concatenate([below, above], axis=-1)  # (B, H, 6)
     beta = rt.softplus_beta
     # softplus(beta * v) / beta — smooth max(0, v).
-    return jnn.softplus(beta * violation) / beta
+    # return jnn.softplus(beta * violation) / beta
+    jax.debug.print(
+        "violation min={} max={} shape={}",
+        jnp.min(violation),
+        jnp.max(violation),
+        violation.shape,
+    )
+
+    return jnp.maximum(violation, 0.0)
 
 
 def _weighted_objective(
