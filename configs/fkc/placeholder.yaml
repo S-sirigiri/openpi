@@ -26,11 +26,11 @@ parallel_nn_and_cost: true
 # "value" weights drive the Feynman-Kac log-weight update.
 w_cost_value: 0.0
 w_eq_value:   0.0
-w_ineq_value: 1000.0
+w_ineq_value: 10.0
 # "grad" weights drive the augmented drift (∇J_grad).
 w_cost_grad:  0.0
 w_eq_grad:    0.0
-w_ineq_grad:  1000.0
+w_ineq_grad:  1.0
 
 # Gibbs-tilt (β_t). Sign flipped internally so strength > 0 pulls toward low cost.
 beta_schedule: constant  # constant | linear_ramp
@@ -64,6 +64,6 @@ fk:
 # banana-in-bowl cost later.
 cost:
   target_xyz:  [0.55, 0.0, 0.25]
-  box_min_xyz: [-1.0, -1.0, 0.0]
-  box_max_xyz: [1.0, 1.0, 1.2]
+  box_min_xyz: [0.45, -0.10, 0.0]
+  box_max_xyz: [0.55, 0.0, 1.2]
   softplus_beta: 10.0

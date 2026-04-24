@@ -19,8 +19,17 @@ convention, t: 1 → 0):
 
 Add Gibbs-tilt guidance (FKC-PDE note, eq 22, translated to flow matching):
 
-    drift_guided = v_t + ½σ²·(score + β_t·∇J_grad)
+    drift_guided = v_t + ½σ²·(score - β_t·∇J_grad)
     Δlog_w       = β_t·⟨∇J_grad, v_t⟩·dt + (β_{t+dt} - β_t)·J_value
+
+Sign note: gr00t's formula has ``+ β_t·∇J`` in the drift because their sampling
+time runs 0 → 1 with ``dt > 0`` and ``β < 0`` means "pull toward low cost" — the
+integration step ``dt·β·∇J`` then points along ``−∇J``. pi0.5 samples the other
+way (t: 1 → 0, ``dt < 0``), so the same ``+β·∇J`` term would flip to ``+∇J``
+under integration and push toward *high* cost. We keep ``β < 0`` as the
+"pull toward low cost" convention (so the log-weight formula is unchanged —
+``β·⟨∇J,v⟩·dt`` picks up two sign flips in pi0.5 that cancel) and instead
+subtract ``β_t·∇J_grad`` in the drift to restore the correct direction.
 
 Three modes, all sharing the same step primitive:
 
@@ -369,14 +378,15 @@ def sample_actions_guided(
         sigma = sigma_value(t_cur_j, fkc_config)
         beta_t = beta_value(t_cur_j, fkc_config)
 
-        # gr00t-style drift (eq 22 of the FKC-PDE notes) adapted to pi0.5's
-        # flow-matching velocity:
-        #     drift = v_t + ½σ²·(score + β_t·∇J_grad)
+        # FKC-PDE eq 22 adapted to pi0.5's flow-matching velocity. pi0.5 runs
+        # the integrator with dt < 0 (t: 1 → 0), which flips the sign of the
+        # guidance term relative to gr00t's dt > 0 convention — so we subtract
+        # β_t·∇J_grad here even though gr00t adds it. See module docstring.
         # When σ=0 the cost contribution and score compensation both vanish,
         # i.e. guidance is inactive — users must set sigma_scale > 0 for
         # linear_combo / fkc modes to have any effect.
         half_sigma_sq = 0.5 * sigma * sigma
-        drift = v_t + half_sigma_sq * (score + beta_t * grad_j)
+        drift = v_t + half_sigma_sq * (score - beta_t * grad_j)
 
         if fkc_config.sigma_schedule != "zero":
             eps = jax.random.normal(noise_rng, x_t.shape, dtype=x_t.dtype)

@@ -85,11 +85,20 @@ def _h_ineq(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
     beta = rt.softplus_beta
     # softplus(beta * v) / beta — smooth max(0, v).
     # return jnn.softplus(beta * violation) / beta
-    jax.debug.print(
-        "violation min={} max={} shape={}",
-        jnp.min(violation),
-        jnp.max(violation),
-        violation.shape,
+    def _print_violation(v):
+        jax.debug.print(
+            "violation min={} max={} shape={}",
+            jnp.min(v),
+            jnp.max(v),
+            v.shape,
+        )
+        return ()
+
+    jax.lax.cond(
+        jnp.max(violation) >= 0,
+        _print_violation,
+        lambda _: (),
+        violation,
     )
 
     return jnp.maximum(violation, 0.0)
