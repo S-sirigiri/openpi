@@ -123,7 +123,8 @@ def _weighted_objective(
     )
     cost_term = w_cost * _L_final_distance(path, rt)
     eq_term = w_eq * jnp.sum(jnp.square(_h_eq(path, rt)), axis=-1)
-    ineq_term = w_ineq * jnp.sum(jnp.square(_h_ineq(path, rt)), axis=(-1, -2))
+    # ineq_term = w_ineq * jnp.sum(jnp.square(_h_ineq(path, rt)), axis=(-1, -2))
+    ineq_term = w_ineq * jnp.sum(_h_ineq(path, rt), axis=(-1, -2))
     return cost_term + eq_term + ineq_term
 
 
