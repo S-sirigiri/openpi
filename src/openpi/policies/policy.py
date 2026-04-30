@@ -166,14 +166,22 @@ class Policy(BasePolicy):
         }
 
     def _materialise_fkc_runtime(self, observation: _model.Observation) -> _fkc_cc.FKRuntime:
-        """Build the per-infer ``FKRuntime`` (un-normalizes the current joint state)."""
+        """Build the per-infer ``FKRuntime`` (un-normalizes the current joint state).
+
+        ``current_joint_vel`` defaults to zero — the DROID observation schema
+        doesn't carry joint velocity, so the actuator rollout starts from rest
+        each chunk. The PD law settles within ~5 substeps so this initial-
+        velocity error washes out quickly.
+        """
         static = self._fkc_static_runtime_parts
         norm_state_7 = observation.state[..., :7]
         abs_joint_pos = norm_state_7 * (static["state_std_7"] + 1e-6) + static["state_mean_7"]
+        zero_vel = jnp.zeros_like(abs_joint_pos)
         return _fkc_cc.FKRuntime(
             action_mean_7=static["action_mean_7"],
             action_std_7=static["action_std_7"],
             current_joint_pos=abs_joint_pos,
+            current_joint_vel=zero_vel,
             base_world_T=static["base_world_T"],
             ee_offset_T=static["ee_offset_T"],
             target_xyz=static["target_xyz"],

@@ -39,6 +39,7 @@ class FKRuntime(NamedTuple):
     action_mean_7: jnp.ndarray    # (7,)
     action_std_7: jnp.ndarray     # (7,)
     current_joint_pos: jnp.ndarray  # (B, 7) absolute radians
+    current_joint_vel: jnp.ndarray  # (B, 7) absolute rad/s — initial v for actuator rollout
     base_world_T: jnp.ndarray     # (4,4)
     ee_offset_T: jnp.ndarray      # (4,4)
 
@@ -50,12 +51,13 @@ class FKRuntime(NamedTuple):
 
 
 def _repeat_runtime_for_particles(rt: FKRuntime, num_particles: int) -> FKRuntime:
-    """Tile ``current_joint_pos`` across the particle dimension."""
+    """Tile ``current_joint_pos`` and ``current_joint_vel`` across particles."""
     if num_particles == 1:
         return rt
-    cjp = rt.current_joint_pos
-    tiled = jnp.repeat(cjp, num_particles, axis=0)
-    return rt._replace(current_joint_pos=tiled)
+    return rt._replace(
+        current_joint_pos=jnp.repeat(rt.current_joint_pos, num_particles, axis=0),
+        current_joint_vel=jnp.repeat(rt.current_joint_vel, num_particles, axis=0),
+    )
 
 
 def _L_final_distance(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
@@ -85,7 +87,7 @@ def _h_ineq(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
     beta = rt.softplus_beta
     # softplus(beta * v) / beta — smooth max(0, v).
     # return jnn.softplus(beta * violation) / beta
-    def _print_violation(v):
+    """def _print_violation(v):
         jax.debug.print(
             "violation min={} max={} shape={}",
             jnp.min(v),
@@ -99,14 +101,34 @@ def _h_ineq(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
         _print_violation,
         lambda _: (),
         violation,
-    )
+    )"""
 
     return jnp.maximum(violation, 0.0)
+
+def _cylinder_avoidance_penalty(world_path: jnp.ndarray) -> jnp.ndarray:
+    """Per-sample cylinder avoidance penalty. Returns shape (B,).
+
+    Hardcoded vertical cylinder centered at (x=0.525, y=0.0) in world frame.
+    Penalizes any EE waypoint whose XY distance from the axis is below
+    cylinder_radius + epsilon (squared-hinge over the horizon, summed).
+    """
+    cylinder_center_xy = jnp.array([0.525, 0.0], dtype=world_path.dtype)
+    cylinder_radius = 0.02
+    epsilon = 0.02
+    effective_radius = cylinder_radius + epsilon
+
+    delta_xy = world_path[..., :2] - cylinder_center_xy           # (B, H, 2)
+    radial_distance = jnp.sqrt(jnp.sum(delta_xy * delta_xy, axis=-1) + 1.0e-12)  # (B, H)
+    radial_clearance = radial_distance - effective_radius          # (B, H)
+    violation = jnp.maximum(-radial_clearance, 0.0)                # (B, H)
+    return jnp.sum(violation, axis=-1)                             # (B,)
+
 
 
 def _weighted_objective(
     actions: jnp.ndarray,
     rt: FKRuntime,
+    fkc_cfg: Any,
     *,
     w_cost: float,
     w_eq: float,
@@ -116,15 +138,18 @@ def _weighted_objective(
     path = build_world_path(
         actions,
         rt.current_joint_pos,
+        rt.current_joint_vel,
         rt.action_mean_7,
         rt.action_std_7,
         rt.base_world_T,
         rt.ee_offset_T,
+        fkc_cfg.dynamics,
     )
     cost_term = w_cost * _L_final_distance(path, rt)
     eq_term = w_eq * jnp.sum(jnp.square(_h_eq(path, rt)), axis=-1)
     # ineq_term = w_ineq * jnp.sum(jnp.square(_h_ineq(path, rt)), axis=(-1, -2))
-    ineq_term = w_ineq * jnp.sum(_h_ineq(path, rt), axis=(-1, -2))
+    # ineq_term = w_ineq * jnp.sum(_h_ineq(path, rt), axis=(-1, -2))
+    ineq_term = w_ineq * _cylinder_avoidance_penalty(path)
     return cost_term + eq_term + ineq_term
 
 
@@ -133,6 +158,7 @@ def J_value(actions: jnp.ndarray, rt: FKRuntime, fkc_cfg: Any) -> jnp.ndarray:
     return _weighted_objective(
         actions,
         rt,
+        fkc_cfg,
         w_cost=fkc_cfg.w_cost_value,
         w_eq=fkc_cfg.w_eq_value,
         w_ineq=fkc_cfg.w_ineq_value,
@@ -143,6 +169,7 @@ def _scalar_J_grad(actions: jnp.ndarray, rt: FKRuntime, fkc_cfg: Any) -> jnp.nda
     per_sample = _weighted_objective(
         actions,
         rt,
+        fkc_cfg,
         w_cost=fkc_cfg.w_cost_grad,
         w_eq=fkc_cfg.w_eq_grad,
         w_ineq=fkc_cfg.w_ineq_grad,

@@ -43,6 +43,29 @@ class FKConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class DynamicsConfig:
+    """Mini-simulator config for ``openpi.fkc.dynamics`` actuator rollout.
+
+    Defaults match RoboLab's ``DroidCfg`` + ``BananaInBowlTask`` env (Isaac Lab
+    ``ImplicitActuator`` with K=400, D=80; sim dt=1/120 s; decimation=8).
+    Disable (``enabled: false``) to fall back to the original "perfect
+    tracking" proxy.
+    """
+
+    enabled: bool = True
+
+    # PD gains applied to all 7 arm joints. Match the actuator config in the
+    # target simulator. Wrong values here = wrong trajectory prediction.
+    stiffness: float = 400.0
+    damping: float = 80.0
+
+    # Physics dt (seconds) and decimation (substeps per control step). Both
+    # come straight from the env config (env_cfg.sim.dt, env_cfg.decimation).
+    sim_dt: float = 1.0 / 120.0
+    decimation: int = 8
+
+
+@dataclasses.dataclass(frozen=True)
 class CostConfig:
     """Placeholder cost / constraint parameters.
 
@@ -146,6 +169,7 @@ class FKCConfig:
     # --- Sub-configs ---------------------------------------------------------
     fk: FKConfig = dataclasses.field(default_factory=FKConfig)
     cost: CostConfig = dataclasses.field(default_factory=CostConfig)
+    dynamics: DynamicsConfig = dataclasses.field(default_factory=DynamicsConfig)
 
 
 def _coerce_tuple(value: Any, length: int) -> tuple[float, ...]:
@@ -170,6 +194,7 @@ def load_fkc_config(path: str | pathlib.Path) -> FKCConfig:
 
     fk_raw = dict(raw.pop("fk", {}) or {})
     cost_raw = dict(raw.pop("cost", {}) or {})
+    dyn_raw = dict(raw.pop("dynamics", {}) or {})
 
     for key in ("base_xyz", "ee_offset_xyz"):
         if key in fk_raw:
@@ -184,4 +209,6 @@ def load_fkc_config(path: str | pathlib.Path) -> FKCConfig:
             cost_raw[key] = _coerce_tuple(cost_raw[key], 3)
     cost = CostConfig(**cost_raw)
 
-    return FKCConfig(fk=fk, cost=cost, **raw)
+    dynamics = DynamicsConfig(**dyn_raw)
+
+    return FKCConfig(fk=fk, cost=cost, dynamics=dynamics, **raw)

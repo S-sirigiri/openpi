@@ -52,18 +52,36 @@ center_log_weight_increment: true
 
 # Forward kinematics: Franka Panda at the world origin (matches RoboLab's
 # BananaInBowlTask scene). Update if another task moves the base.
+#
+# ee_offset_xyz: 0.01817 m along link8's z-axis is the offset from panda_link8
+# (where the FK chain ends) to the Robotiq 2F-85 ``base_link`` (the body whose
+# pose RoboLab records). Calibrated against a recorded BananaInBowl episode:
+# residual was constant at 0.01817 m to 5 decimals across all 750 timesteps.
 fk:
   robot: franka_panda
   base_xyz: [0.0, 0.0, 0.0]
   base_quat_xyzw: [0.0, 0.0, 0.0, 1.0]
-  ee_offset_xyz: [0.0, 0.0, 0.0]
+  ee_offset_xyz: [0.0, 0.0, 0.01817]
   ee_offset_quat_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+# Mini physics simulator. ``enabled: true`` rolls each chunk through Isaac
+# Lab's implicit-PD law so the constraint sees the trajectory the simulator
+# will actually execute (controller lag + joint-position-limit clipping)
+# rather than assuming perfect tracking. Verified to match recorded sim joint
+# trajectory to 0.002 rad RMS over a 15-step chunk. Defaults match RoboLab's
+# DroidCfg (K=400, D=80, sim_dt=1/120, decimation=8).
+dynamics:
+  enabled: true
+  stiffness: 400.0
+  damping: 80.0
+  sim_dt: 0.008333333333333333  # 1/120 s
+  decimation: 8
 
 # Placeholder task: pull the final EE position toward this world target and
 # keep every waypoint inside a wide bounding box. Replace with the real
 # banana-in-bowl cost later.
 cost:
   target_xyz:  [0.55, 0.0, 0.25]
-  box_min_xyz: [0.15, -0.10, 0.0]
-  box_max_xyz: [0.36, -0.02, 1.2]
+  box_min_xyz: [0.30, -0.12, 0.0]
+  box_max_xyz: [0.55, -0.02, 1.2]
   softplus_beta: 10.0
