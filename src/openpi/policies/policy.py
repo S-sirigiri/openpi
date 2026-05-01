@@ -95,6 +95,12 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        # Strip ``fkc/*`` guidance extras (e.g., SDF grid) before they reach
+        # the input_transform pipeline, which is for model inputs only.
+        fkc_extras: dict[str, Any] = {}
+        for key in list(inputs.keys()):
+            if isinstance(key, str) and key.startswith("fkc/"):
+                fkc_extras[key[len("fkc/") :]] = inputs.pop(key)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -119,7 +125,7 @@ class Policy(BasePolicy):
         if self._fkc_active:
             sample_kwargs = dict(sample_kwargs)
             sample_kwargs["fkc_config"] = self._fkc_config
-            sample_kwargs["fkc_runtime"] = self._materialise_fkc_runtime(observation)
+            sample_kwargs["fkc_runtime"] = self._materialise_fkc_runtime(observation, fkc_extras)
             sample_kwargs["num_steps"] = self._resolved_num_steps
         outputs = {
             "state": inputs["state"],
@@ -160,13 +166,20 @@ class Policy(BasePolicy):
             "base_world_T": base_world_T,
             "ee_offset_T": ee_offset_T,
             "target_xyz": jnp.asarray(fkc_config.cost.target_xyz, dtype=jnp.float32),
-            "box_min_xyz": jnp.asarray(fkc_config.cost.box_min_xyz, dtype=jnp.float32),
-            "box_max_xyz": jnp.asarray(fkc_config.cost.box_max_xyz, dtype=jnp.float32),
-            "softplus_beta": jnp.asarray(fkc_config.cost.softplus_beta, dtype=jnp.float32),
+            "default_safety_margin": jnp.asarray(fkc_config.collision.safety_margin, dtype=jnp.float32),
+            "softplus_beta": jnp.asarray(fkc_config.collision.softplus_beta, dtype=jnp.float32),
         }
 
-    def _materialise_fkc_runtime(self, observation: _model.Observation) -> _fkc_cc.FKRuntime:
-        """Build the per-infer ``FKRuntime`` (un-normalizes the current joint state).
+    def _materialise_fkc_runtime(
+        self,
+        observation: _model.Observation,
+        fkc_extras: dict[str, Any],
+    ) -> _fkc_cc.FKRuntime:
+        """Build the per-infer ``FKRuntime`` (un-normalizes joint state, lifts SDF).
+
+        The SDF grid arrives via ``fkc_extras`` — the dict of ``fkc/*`` keys
+        peeled off the raw observation in :meth:`infer`. RoboLab's nvblox
+        sidecar is the canonical producer.
 
         ``current_joint_vel`` defaults to zero — the DROID observation schema
         doesn't carry joint velocity, so the actuator rollout starts from rest
@@ -177,6 +190,27 @@ class Policy(BasePolicy):
         norm_state_7 = observation.state[..., :7]
         abs_joint_pos = norm_state_7 * (static["state_std_7"] + 1e-6) + static["state_mean_7"]
         zero_vel = jnp.zeros_like(abs_joint_pos)
+
+        if "sdf_grid" not in fkc_extras:
+            raise ValueError(
+                "FKC guidance requires fkc/sdf_grid in the observation. "
+                "Build the SDF on the client (e.g., RoboLab's nvblox sidecar) "
+                "and attach fkc/sdf_grid + fkc/sdf_origin + fkc/sdf_voxel_size "
+                "as extra observation keys before calling Policy.infer."
+            )
+        sdf_grid = jnp.asarray(fkc_extras["sdf_grid"], dtype=jnp.float32)
+        if sdf_grid.ndim != 3:
+            raise ValueError(
+                f"fkc/sdf_grid must be a 3D array (Nx, Ny, Nz); got shape {sdf_grid.shape}"
+            )
+        sdf_origin = jnp.asarray(fkc_extras["sdf_origin"], dtype=jnp.float32)
+        sdf_voxel_size = jnp.asarray(fkc_extras["sdf_voxel_size"], dtype=jnp.float32).reshape(())
+        # Optional per-replan override of the safety margin (e.g., shrink it
+        # during fine-grained placement). Falls back to the static config value.
+        safety_margin = jnp.asarray(
+            fkc_extras.get("safety_margin", static["default_safety_margin"]),
+            dtype=jnp.float32,
+        ).reshape(())
         return _fkc_cc.FKRuntime(
             action_mean_7=static["action_mean_7"],
             action_std_7=static["action_std_7"],
@@ -185,8 +219,10 @@ class Policy(BasePolicy):
             base_world_T=static["base_world_T"],
             ee_offset_T=static["ee_offset_T"],
             target_xyz=static["target_xyz"],
-            box_min_xyz=static["box_min_xyz"],
-            box_max_xyz=static["box_max_xyz"],
+            sdf_grid=sdf_grid,
+            sdf_origin=sdf_origin,
+            sdf_voxel_size=sdf_voxel_size,
+            safety_margin=safety_margin,
             softplus_beta=static["softplus_beta"],
         )
 

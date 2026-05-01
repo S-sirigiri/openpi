@@ -1,21 +1,30 @@
-"""Placeholder cost L(x), constraints h_eq / h_ineq, and the composite J(x).
+"""Cost ``L(x)``, equality / inequality residuals, and the composite ``J(x)``.
 
-Everything here is deliberately lightweight — the user will swap in real
-task-specific cost/constraint functions later. The scaffolding is what matters
-for now:
+The inequality term is an **SDF-based collision avoidance penalty** built from
+a voxelised Euclidean Signed Distance Field (ESDF) of the scene. The ESDF is
+constructed once per ``Policy.infer`` call by RoboLab's nvblox sidecar, shipped
+through the websocket as ``fkc/sdf_*`` keys, and threaded into the ``FKRuntime``
+NamedTuple — the constraint side never imports torch / nvblox.
+
+Wiring per call:
 
 * ``J_value`` applies the *value* weight set ``w_*_value`` from ``FKCConfig``.
+  This enters the Feynman-Kac log-weight update.
 * ``J_grad`` applies the *gradient* weight set ``w_*_grad`` and returns
-  ∇_actions of the weighted objective via ``jax.grad``.
+  ``∇_actions`` of the weighted objective via ``jax.grad``. This enters the
+  augmented drift in ``sample_actions_guided``.
 
-Those two distinct weight sets are the user-requested decoupling: ``J_value``
-enters the Feynman-Kac log-weight update, while ``J_grad`` enters the augmented
-drift. In gr00t's original implementation both came from the same weighted J.
+Currently:
+    - L(path):   returns 0 (placeholder; the user's intent is to replace later).
+    - h_eq:      returns zeros (no equality constraints active).
+    - h_ineq:    SDF collision penalty across all FK collision points and all
+                 horizon steps.
 
-Current placeholders:
-    - L(path):  squared distance of the final EE position to ``target_xyz``.
-    - h_eq:     none for now (returns a scalar 0 tensor so sums work).
-    - h_ineq:   axis-aligned bounding-box penalty, softplus-smoothed.
+When the SDF grid is absent (e.g., baseline/no-RoboLab runs), a degenerate
+1×1×1 grid filled with a large positive value is shipped via the no-op fallback
+in ``policy.py`` — this means every collision query returns
+``sdf >> safety_margin`` and the penalty is 0 everywhere, so the FKC pipeline
+stays wired up but contributes nothing.
 """
 
 from __future__ import annotations
@@ -26,14 +35,18 @@ import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 
-from openpi.fkc.path import build_world_path
+from openpi.fkc.path import build_world_collision_path
 
 
 class FKRuntime(NamedTuple):
-    """JAX-friendly bundle of the per-rollout FK + normalization context.
+    """JAX-friendly bundle of the per-rollout FK + SDF context.
 
     Rebuilt once per ``Policy.infer`` call and passed through the sampling loop
     as a leaf-traced structure (it's a PyTree of jnp arrays so jit is happy).
+
+    The SDF lives on the runtime (rather than the static FKCConfig) because
+    the grid contents change with every replan but the *shape* stays fixed —
+    so JIT recompiles only once.
     """
 
     action_mean_7: jnp.ndarray    # (7,)
@@ -43,15 +56,22 @@ class FKRuntime(NamedTuple):
     base_world_T: jnp.ndarray     # (4,4)
     ee_offset_T: jnp.ndarray      # (4,4)
 
-    # Cost / constraint parameters, pre-materialised as jnp arrays.
+    # Reserved for a future terminal cost. Kept on the runtime for symmetry
+    # with the constraint params even though ``_L_zero`` doesn't read it.
     target_xyz: jnp.ndarray       # (3,)
-    box_min_xyz: jnp.ndarray      # (3,)
-    box_max_xyz: jnp.ndarray      # (3,)
-    softplus_beta: jnp.ndarray    # scalar
+
+    # SDF — the heart of the constraint.
+    sdf_grid: jnp.ndarray         # (Nx, Ny, Nz) float32, positive outside obstacles
+    sdf_origin: jnp.ndarray       # (3,) world-frame position of voxel (0,0,0)
+    sdf_voxel_size: jnp.ndarray   # scalar float32, edge length of one voxel (m)
+
+    # Constraint hinge parameters.
+    safety_margin: jnp.ndarray    # scalar float32, hinge fires when sdf < margin
+    softplus_beta: jnp.ndarray    # scalar float32, hinge sharpness
 
 
 def _repeat_runtime_for_particles(rt: FKRuntime, num_particles: int) -> FKRuntime:
-    """Tile ``current_joint_pos`` and ``current_joint_vel`` across particles."""
+    """Tile per-batch fields across particles. SDF / static fields are shared."""
     if num_particles == 1:
         return rt
     return rt._replace(
@@ -60,69 +80,102 @@ def _repeat_runtime_for_particles(rt: FKRuntime, num_particles: int) -> FKRuntim
     )
 
 
-def _L_final_distance(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
-    """Placeholder cost: squared distance of last EE waypoint to a target."""
-    last = world_path[..., -1, :]  # (B, 3)
-    diff = last - rt.target_xyz
-    return jnp.sum(diff * diff, axis=-1)  # (B,)
+def _L_zero(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
+    """Placeholder cost: zero, with the right shape ``(B,)``.
+
+    Kept as a function (rather than literal 0) so the existing weighted-sum
+    scaffolding in ``_weighted_objective`` continues to compose cleanly when a
+    real terminal cost is plugged in later.
+    """
+    del rt
+    # world_path: (B, H, P, 3) — collision-path layout. Take batch axis.
+    return jnp.zeros((world_path.shape[0],), dtype=world_path.dtype)
 
 
 def _h_eq(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
-    """Placeholder equality residual — none active. Returns (B, 1) of zeros so
-    the squared sum is well-defined and JIT-traceable. Replace later."""
+    """No equality constraints active. Returns ``(B, 1)`` of zeros so the
+    squared sum is well-defined and traceable."""
     del rt
-    b = world_path.shape[0]
-    return jnp.zeros((b, 1), dtype=world_path.dtype)
+    return jnp.zeros((world_path.shape[0], 1), dtype=world_path.dtype)
 
 
-def _h_ineq(world_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
-    """Placeholder inequality residual: keep every EE waypoint inside a box.
+def _sdf_trilinear(
+    grid: jnp.ndarray,
+    origin: jnp.ndarray,
+    voxel_size: jnp.ndarray,
+    points: jnp.ndarray,
+) -> jnp.ndarray:
+    """Trilinear interpolation of a regular 3D scalar field at world points.
 
-    Positive values mean a violation; softplus makes the hinge smooth so the
-    gradient is non-zero on the boundary.
+    Args:
+        grid: ``(Nx, Ny, Nz)`` SDF values in world frame. ``grid[i,j,k]`` is
+            the value at world position ``origin + voxel_size * (i,j,k)``.
+        origin: ``(3,)`` world-frame position of voxel ``(0, 0, 0)``.
+        voxel_size: scalar — the edge length of a voxel in metres.
+        points: ``(..., 3)`` world-frame query points.
+
+    Returns:
+        ``(...)`` interpolated SDF values. Out-of-grid points are clamped to
+        the nearest in-grid voxel — for FKC this is fine because the grid is
+        sized to comfortably contain the workspace and far-away points reading
+        the boundary value (which is large/free) yields zero penalty.
+
+    Pure JAX, fully ``jit`` and ``grad`` friendly: the trilinear weighting is
+    smooth, so ``jax.grad`` propagates gradients to the query ``points``.
     """
-    below = rt.box_min_xyz - world_path  # (B, H, 3), >0 when violated
-    above = world_path - rt.box_max_xyz
-    violation = jnp.concatenate([below, above], axis=-1)  # (B, H, 6)
+    nx, ny, nz = grid.shape
+    # Convert world coords to fractional voxel coords.
+    grid_xyz = (points - origin) / voxel_size  # (..., 3)
+    # Floor to integer voxel indices, clamping so the +1 neighbour is in-bounds.
+    i0 = jnp.clip(jnp.floor(grid_xyz[..., 0]).astype(jnp.int32), 0, nx - 2)
+    j0 = jnp.clip(jnp.floor(grid_xyz[..., 1]).astype(jnp.int32), 0, ny - 2)
+    k0 = jnp.clip(jnp.floor(grid_xyz[..., 2]).astype(jnp.int32), 0, nz - 2)
+    i1, j1, k1 = i0 + 1, j0 + 1, k0 + 1
+    # Fractional weights, also clamped to [0, 1] so out-of-grid queries fall
+    # back to the boundary voxel value (which represents "free space" given
+    # how the grid is sized).
+    fx = jnp.clip(grid_xyz[..., 0] - i0.astype(grid_xyz.dtype), 0.0, 1.0)
+    fy = jnp.clip(grid_xyz[..., 1] - j0.astype(grid_xyz.dtype), 0.0, 1.0)
+    fz = jnp.clip(grid_xyz[..., 2] - k0.astype(grid_xyz.dtype), 0.0, 1.0)
+    # 8 corner samples.
+    c000 = grid[i0, j0, k0]
+    c001 = grid[i0, j0, k1]
+    c010 = grid[i0, j1, k0]
+    c011 = grid[i0, j1, k1]
+    c100 = grid[i1, j0, k0]
+    c101 = grid[i1, j0, k1]
+    c110 = grid[i1, j1, k0]
+    c111 = grid[i1, j1, k1]
+    # Trilinear interpolation.
+    c00 = c000 * (1 - fx) + c100 * fx
+    c01 = c001 * (1 - fx) + c101 * fx
+    c10 = c010 * (1 - fx) + c110 * fx
+    c11 = c011 * (1 - fx) + c111 * fx
+    c0 = c00 * (1 - fy) + c10 * fy
+    c1 = c01 * (1 - fy) + c11 * fy
+    return c0 * (1 - fz) + c1 * fz
+
+
+def _sdf_collision_penalty(world_collision_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
+    """Softplus-smoothed hinge over ``safety_margin - sdf(p)`` for every point.
+
+    Args:
+        world_collision_path: ``(B, H, P, 3)`` world-frame collision-sample
+            points along the predicted arm trajectory.
+        rt: runtime carrying the SDF grid + origin + voxel_size + margin.
+
+    Returns:
+        ``(B,)`` sum of point-wise penalties across all H horizon steps and
+        all P body points.
+    """
+    sdf_values = _sdf_trilinear(
+        rt.sdf_grid, rt.sdf_origin, rt.sdf_voxel_size, world_collision_path
+    )  # (B, H, P)
+    excess = rt.safety_margin - sdf_values
+    # softplus(beta * x) / beta — smooth max(0, x) hinge.
     beta = rt.softplus_beta
-    # softplus(beta * v) / beta — smooth max(0, v).
-    # return jnn.softplus(beta * violation) / beta
-    """def _print_violation(v):
-        jax.debug.print(
-            "violation min={} max={} shape={}",
-            jnp.min(v),
-            jnp.max(v),
-            v.shape,
-        )
-        return ()
-
-    jax.lax.cond(
-        jnp.max(violation) >= 0,
-        _print_violation,
-        lambda _: (),
-        violation,
-    )"""
-
-    return jnp.maximum(violation, 0.0)
-
-def _cylinder_avoidance_penalty(world_path: jnp.ndarray) -> jnp.ndarray:
-    """Per-sample cylinder avoidance penalty. Returns shape (B,).
-
-    Hardcoded vertical cylinder centered at (x=0.525, y=0.0) in world frame.
-    Penalizes any EE waypoint whose XY distance from the axis is below
-    cylinder_radius + epsilon (squared-hinge over the horizon, summed).
-    """
-    cylinder_center_xy = jnp.array([0.525, 0.0], dtype=world_path.dtype)
-    cylinder_radius = 0.02
-    epsilon = 0.02
-    effective_radius = cylinder_radius + epsilon
-
-    delta_xy = world_path[..., :2] - cylinder_center_xy           # (B, H, 2)
-    radial_distance = jnp.sqrt(jnp.sum(delta_xy * delta_xy, axis=-1) + 1.0e-12)  # (B, H)
-    radial_clearance = radial_distance - effective_radius          # (B, H)
-    violation = jnp.maximum(-radial_clearance, 0.0)                # (B, H)
-    return jnp.sum(violation, axis=-1)                             # (B,)
-
+    penalty = jnn.softplus(beta * excess) / beta
+    return jnp.sum(penalty, axis=(-2, -1))  # (B,)
 
 
 def _weighted_objective(
@@ -135,7 +188,7 @@ def _weighted_objective(
     w_ineq: float,
 ) -> jnp.ndarray:
     """Weighted scalar objective. Shape: (B,)."""
-    path = build_world_path(
+    path = build_world_collision_path(
         actions,
         rt.current_joint_pos,
         rt.current_joint_vel,
@@ -144,12 +197,13 @@ def _weighted_objective(
         rt.base_world_T,
         rt.ee_offset_T,
         fkc_cfg.dynamics,
+        collision_mode=fkc_cfg.collision.mode,
+        arm_sample_points=fkc_cfg.collision.arm_sample_points,
+        full_body_points=fkc_cfg.collision.full_body_points,
     )
-    cost_term = w_cost * _L_final_distance(path, rt)
+    cost_term = w_cost * _L_zero(path, rt)
     eq_term = w_eq * jnp.sum(jnp.square(_h_eq(path, rt)), axis=-1)
-    # ineq_term = w_ineq * jnp.sum(jnp.square(_h_ineq(path, rt)), axis=(-1, -2))
-    # ineq_term = w_ineq * jnp.sum(_h_ineq(path, rt), axis=(-1, -2))
-    ineq_term = w_ineq * _cylinder_avoidance_penalty(path)
+    ineq_term = w_ineq * _sdf_collision_penalty(path, rt)
     return cost_term + eq_term + ineq_term
 
 

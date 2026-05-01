@@ -70,6 +70,27 @@ def make_static_transform(xyz: tuple[float, float, float], quat_xyzw: tuple[floa
     return T.at[:3, 3].set(jnp.asarray(xyz, dtype=jnp.float32))
 
 
+def _chain_link_transforms(joint_pos_7: jnp.ndarray, base_world_T: jnp.ndarray) -> jnp.ndarray:
+    """Returns ``(8, 4, 4)``: ``[base, link1, ..., link7]`` world-frame transforms.
+
+    The i-th entry (1 ≤ i ≤ 7) is the world-frame pose of the panda_link``i``
+    frame after applying joints 1..i. Entry 0 is the base (panda_link0).
+    """
+    transforms = [base_world_T]
+    T = base_world_T
+    for i, (a, alpha, d, theta_off) in enumerate(_FRANKA_MDH):
+        T = T @ _mdh_transform(a, alpha, d, joint_pos_7[i] + theta_off)
+        transforms.append(T)
+    return jnp.stack(transforms, axis=0)
+
+
+def _flange_and_ee_transforms(link7_T: jnp.ndarray, ee_offset_T: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    flange_offset = jnp.eye(4, dtype=link7_T.dtype).at[2, 3].set(_FLANGE_OFFSET_Z)
+    T_flange = link7_T @ flange_offset
+    T_ee = T_flange @ ee_offset_T
+    return T_flange, T_ee
+
+
 def franka_fk(
     joint_pos_7: jnp.ndarray,
     base_world_T: jnp.ndarray,
@@ -84,18 +105,128 @@ def franka_fk(
 
     The full chain is base_world @ link_1 @ ... @ link_7 @ flange_offset @ ee_offset.
     """
-    T = base_world_T
-    for i, (a, alpha, d, theta_off) in enumerate(_FRANKA_MDH):
-        T = T @ _mdh_transform(a, alpha, d, joint_pos_7[i] + theta_off)
-    # Flange offset along +z (panda_link7 -> panda_link8).
-    flange_offset = jnp.eye(4).at[2, 3].set(_FLANGE_OFFSET_Z)
-    T = T @ flange_offset @ ee_offset_T
-    return T
+    chain = _chain_link_transforms(joint_pos_7, base_world_T)
+    _, T_ee = _flange_and_ee_transforms(chain[-1], ee_offset_T)
+    return T_ee
 
 
 def franka_fk_position(joint_pos_7: jnp.ndarray, base_world_T: jnp.ndarray, ee_offset_T: jnp.ndarray) -> jnp.ndarray:
     """Convenience: return just the (3,) world-frame EE position."""
     return franka_fk(joint_pos_7, base_world_T, ee_offset_T)[:3, 3]
+
+
+# Local-frame offsets for the gripper finger / palm sample points, expressed
+# in the EE frame (after ``ee_offset_T`` has been applied). The Robotiq 2F-85
+# fully-open finger separation is ~85 mm, tips reach ~6 cm forward of the
+# flange. These three points cover the gripper body volume coarsely.
+_GRIPPER_LOCAL_POINTS: tuple[tuple[float, float, float], ...] = (
+    (0.0, -0.040, 0.060),  # left finger tip
+    (0.0,  0.040, 0.060),  # right finger tip
+    (0.0,  0.000, 0.020),  # palm
+)
+
+
+def _polyline_arc_samples(polyline: jnp.ndarray, n: int) -> jnp.ndarray:
+    """Sample ``n`` points along a polyline at uniform arc length.
+
+    polyline: ``(K, 3)`` of K joint origins through the kinematic chain.
+    Returns ``(n, 3)``. Pure JAX, ``jit``/``grad`` friendly.
+    """
+    seg_vecs = polyline[1:] - polyline[:-1]
+    seg_lens = jnp.sqrt(jnp.sum(seg_vecs * seg_vecs, axis=-1) + 1e-12)  # (K-1,)
+    cum_lens = jnp.concatenate(
+        [jnp.zeros((1,), dtype=seg_lens.dtype), jnp.cumsum(seg_lens)],
+        axis=0,
+    )  # (K,)
+    total_len = cum_lens[-1]
+    # Uniform fractions in [0, 1] mapped to arc length.
+    fractions = jnp.linspace(0.0, 1.0, n, dtype=polyline.dtype)
+    sample_t = fractions * total_len  # (n,)
+    # Locate the segment containing each sample. searchsorted returns the
+    # rightmost insertion index; we subtract 1 to get the segment index, and
+    # clip to [0, K-2] so endpoints behave (the last point lands at the end
+    # of the final segment).
+    raw_idx = jnp.searchsorted(cum_lens, sample_t)
+    seg_idx = jnp.clip(raw_idx - 1, 0, polyline.shape[0] - 2)
+    seg_starts = polyline[seg_idx]
+    seg_ends = polyline[seg_idx + 1]
+    seg_local = (sample_t - cum_lens[seg_idx]) / (seg_lens[seg_idx] + 1e-12)
+    return seg_starts + seg_local[:, None] * (seg_ends - seg_starts)
+
+
+def franka_collision_points(
+    joint_pos_7: jnp.ndarray,
+    base_world_T: jnp.ndarray,
+    ee_offset_T: jnp.ndarray,
+    *,
+    mode: str,
+    arm_sample_points: int = 8,
+    full_body_points: int = 30,
+) -> jnp.ndarray:
+    """Sample world-frame points along the robot for SDF collision queries.
+
+    The number of points returned depends on ``mode`` and the count knobs:
+
+    * ``"ee_only"`` -> ``(1, 3)``: just the EE position (matches
+      ``franka_fk_position``).
+    * ``"ee_plus_arm"`` -> ``(arm_sample_points + 4, 3)``: EE + 3 gripper points
+      (two finger tips + palm) + ``arm_sample_points`` points spaced uniformly
+      along the kinematic-chain polyline (link1 -> ... -> link7 -> flange ->
+      ee). Default ``arm_sample_points=8`` gives 12 points.
+    * ``"full"`` -> ``(full_body_points + 4, 3)``: same structure but with
+      ``full_body_points`` along the arm. Default 30 gives 34 points.
+
+    All counts are static at JIT trace time because ``mode`` and the integer
+    knobs are read from ``FKCConfig`` (a static argument). ``jit`` and ``grad``
+    propagate cleanly through the polyline sampling.
+    """
+    chain = _chain_link_transforms(joint_pos_7, base_world_T)  # (8, 4, 4)
+    T_flange, T_ee = _flange_and_ee_transforms(chain[-1], ee_offset_T)
+    ee_origin = T_ee[:3, 3]
+
+    if mode == "ee_only":
+        return ee_origin[None, :]
+
+    # Gripper finger / palm points: transform local offsets through T_ee.
+    local = jnp.asarray(_GRIPPER_LOCAL_POINTS, dtype=base_world_T.dtype)  # (3, 3)
+    local_h = jnp.concatenate([local, jnp.ones((local.shape[0], 1), dtype=local.dtype)], axis=-1)  # (3, 4)
+    gripper_world = (T_ee @ local_h.T)[:3, :].T  # (3, 3)
+
+    # Polyline through link1..link7, flange, ee — the arm physical centerline.
+    polyline = jnp.concatenate(
+        [chain[1:, :3, 3], T_flange[:3, 3][None, :], ee_origin[None, :]], axis=0
+    )  # (9, 3)
+
+    if mode == "ee_plus_arm":
+        n_arm = int(arm_sample_points)
+    elif mode == "full":
+        n_arm = int(full_body_points)
+    else:
+        raise ValueError(
+            f"Unknown collision mode: {mode!r}. Expected 'ee_only', 'ee_plus_arm', or 'full'."
+        )
+
+    arm_samples = _polyline_arc_samples(polyline, n_arm)  # (n_arm, 3)
+    return jnp.concatenate(
+        [ee_origin[None, :], gripper_world, arm_samples],
+        axis=0,
+    )  # (n_arm + 4, 3)
+
+
+def collision_points_count(mode: str, arm_sample_points: int = 8, full_body_points: int = 30) -> int:
+    """Static count of collision points for a given mode.
+
+    Useful for shape inference outside JIT.
+    """
+    if mode == "ee_only":
+        return 1
+    if mode == "ee_plus_arm":
+        return int(arm_sample_points) + 4
+    if mode == "full":
+        return int(full_body_points) + 4
+    raise ValueError(
+        f"Unknown collision mode: {mode!r}. Expected 'ee_only', 'ee_plus_arm', or 'full'."
+    )
 
 
 def build_fk_transforms(fk_cfg: Any) -> tuple[jnp.ndarray, jnp.ndarray]:

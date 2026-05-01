@@ -26,7 +26,8 @@ Inputs the cost uses:
     - current_joint_vel: (B, 7) absolute, in rad/s — initial v for the rollout
     - norm stats for the first 7 action dims
 Output:
-    - world_path: (B, horizon, 3) EE positions along the predicted horizon
+    - ``build_world_path``: (B, horizon, 3) EE positions
+    - ``build_world_collision_path``: (B, horizon, P, 3) collision points
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ import jax
 import jax.numpy as jnp
 
 from openpi.fkc.dynamics import actuator_rollout
-from openpi.fkc.fk import franka_fk_position
+from openpi.fkc.fk import franka_collision_points, franka_fk_position
 
 
 def unnormalize_joint_deltas(
@@ -47,6 +48,34 @@ def unnormalize_joint_deltas(
 ) -> jnp.ndarray:
     """Undo openpi's z-score normalization on the first 7 action dims."""
     return normalized_deltas * (action_std_7 + 1e-6) + action_mean_7
+
+
+def _abs_joint_chunk(
+    actions: jnp.ndarray,
+    current_joint_pos: jnp.ndarray,
+    current_joint_vel: jnp.ndarray,
+    action_mean_7: jnp.ndarray,
+    action_std_7: jnp.ndarray,
+    base_world_T: jnp.ndarray,
+    dynamics_cfg: Any,
+) -> jnp.ndarray:
+    """Return (B, H, 7) absolute joint trajectory the simulator will execute."""
+    arm_deltas_norm = actions[..., :7]
+    arm_deltas = unnormalize_joint_deltas(arm_deltas_norm, action_mean_7, action_std_7)
+    q_cmd_chunk = arm_deltas + current_joint_pos[..., None, :]  # (B, H, 7)
+
+    if dynamics_cfg.enabled:
+        return actuator_rollout(
+            current_joint_pos,
+            current_joint_vel,
+            q_cmd_chunk,
+            base_world_T=base_world_T,
+            dt=dynamics_cfg.sim_dt,
+            decimation=dynamics_cfg.decimation,
+            K=dynamics_cfg.stiffness,
+            D=dynamics_cfg.damping,
+        )
+    return q_cmd_chunk
 
 
 def build_world_path(
@@ -75,29 +104,57 @@ def build_world_path(
     Returns:
         (B, H, 3) EE positions in world coordinates.
     """
-    arm_deltas_norm = actions[..., :7]
-    arm_deltas = unnormalize_joint_deltas(arm_deltas_norm, action_mean_7, action_std_7)
-    # Absolute joint commands per horizon step (matches the AbsoluteActions
-    # output transform applied to model outputs at inference).
-    q_cmd_chunk = arm_deltas + current_joint_pos[..., None, :]  # (B, H, 7)
-
-    if dynamics_cfg.enabled:
-        # Roll the chunk through Isaac Lab's PD law. Output: (B, H, 7) — the
-        # joint trajectory the simulator will actually execute.
-        abs_joints = actuator_rollout(
-            current_joint_pos,
-            current_joint_vel,
-            q_cmd_chunk,
-            base_world_T=base_world_T,
-            dt=dynamics_cfg.sim_dt,
-            decimation=dynamics_cfg.decimation,
-            K=dynamics_cfg.stiffness,
-            D=dynamics_cfg.damping,
-        )
-    else:
-        # Legacy "perfect tracking" proxy: the chunk's joint trajectory IS the
-        # commanded chunk. Useful for ablation only.
-        abs_joints = q_cmd_chunk
-
+    abs_joints = _abs_joint_chunk(
+        actions,
+        current_joint_pos,
+        current_joint_vel,
+        action_mean_7,
+        action_std_7,
+        base_world_T,
+        dynamics_cfg,
+    )
     fk_pos = jax.vmap(jax.vmap(lambda q: franka_fk_position(q, base_world_T, ee_offset_T)))
     return fk_pos(abs_joints)
+
+
+def build_world_collision_path(
+    actions: jnp.ndarray,
+    current_joint_pos: jnp.ndarray,
+    current_joint_vel: jnp.ndarray,
+    action_mean_7: jnp.ndarray,
+    action_std_7: jnp.ndarray,
+    base_world_T: jnp.ndarray,
+    ee_offset_T: jnp.ndarray,
+    dynamics_cfg: Any,
+    *,
+    collision_mode: str,
+    arm_sample_points: int = 8,
+    full_body_points: int = 30,
+) -> jnp.ndarray:
+    """Like ``build_world_path`` but emits a batch of collision sample points.
+
+    Returns ``(B, H, P, 3)`` where ``P`` depends on ``collision_mode`` and the
+    count knobs (see ``franka_collision_points``).
+    """
+    abs_joints = _abs_joint_chunk(
+        actions,
+        current_joint_pos,
+        current_joint_vel,
+        action_mean_7,
+        action_std_7,
+        base_world_T,
+        dynamics_cfg,
+    )
+
+    def per_waypoint(q: jnp.ndarray) -> jnp.ndarray:
+        return franka_collision_points(
+            q,
+            base_world_T,
+            ee_offset_T,
+            mode=collision_mode,
+            arm_sample_points=arm_sample_points,
+            full_body_points=full_body_points,
+        )
+
+    fk_pts = jax.vmap(jax.vmap(per_waypoint))
+    return fk_pts(abs_joints)

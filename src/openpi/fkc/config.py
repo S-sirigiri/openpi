@@ -67,25 +67,55 @@ class DynamicsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class CostConfig:
-    """Placeholder cost / constraint parameters.
+    """Cost-term parameters.
 
-    The real task cost (banana-to-bowl etc.) will replace these later. For now
-    the shipping default drives the EE toward ``target_xyz`` in world frame and
-    keeps it inside a large bounding box so the constraint path is exercised
-    end-to-end without affecting rollouts much.
+    The cost term ``L(x)`` is currently a no-op (``_L_zero`` returns 0) — the
+    SDF-based collision constraint in :class:`CollisionConfig` carries all the
+    semantics. ``target_xyz`` is preserved as a knob so a per-task terminal
+    cost can be added later without changing the YAML schema.
     """
 
-    # A static target in world frame that the final EE position is pulled toward.
+    # Reserved for a future terminal cost. Currently unused (``_L_zero`` ignores
+    # it) but kept in the dataclass so YAMLs setting it don't break.
     target_xyz: tuple[float, float, float] = (0.55, 0.0, 0.25)
 
-    # Inequality constraint: axis-aligned world-frame bounding box that every EE
-    # waypoint must stay inside. Wide enough by default to be mostly inactive.
-    box_min_xyz: tuple[float, float, float] = (-1.0, -1.0, 0.0)
-    box_max_xyz: tuple[float, float, float] = (1.0, 1.0, 1.2)
 
-    # Softplus sharpness used to smooth the inequality hinge (higher = closer to
-    # a hard hinge, matches gr00t's ``softplus_beta`` knob).
-    softplus_beta: float = 10.0
+@dataclasses.dataclass(frozen=True)
+class CollisionConfig:
+    """SDF-based collision-avoidance constraint parameters.
+
+    The constraint is a softplus-smoothed hinge: for every collision sample
+    point ``p`` along the predicted arm trajectory, penalty is
+    ``softplus(softplus_beta * (safety_margin - sdf(p))) / softplus_beta``.
+
+    The SDF itself is provided per ``Policy.infer`` call via ``fkc_extras``
+    (built by RoboLab's nvblox sidecar) and lives on the ``FKRuntime``. Only
+    the static knobs (mode, margin, sample counts, sharpness) belong here.
+    """
+
+    # Which body points to query against the SDF. Static at JIT trace time.
+    #   - "ee_only": just the end-effector position (1 point).
+    #   - "ee_plus_arm": EE + 3 gripper points + ``arm_sample_points`` along
+    #     the arm polyline. Default is the recommended setting.
+    #   - "full": EE + 3 gripper points + ``full_body_points`` along the arm.
+    mode: Literal["ee_only", "ee_plus_arm", "full"] = "ee_plus_arm"
+
+    # Distance (metres) below which the penalty starts firing. With nvblox's
+    # ESDF using positive-outside-the-obstacle convention, we penalise points
+    # whose ``sdf < safety_margin``. 2 cm is a reasonable starting clearance
+    # for the Franka + Robotiq pair on a tabletop.
+    safety_margin: float = 0.02
+
+    # Number of arm-polyline samples used in ``ee_plus_arm`` mode.
+    arm_sample_points: int = 8
+
+    # Number of arm-polyline samples used in ``full`` mode.
+    full_body_points: int = 30
+
+    # Softplus sharpness for the hinge — higher = closer to ReLU, smoother
+    # near the boundary. With safety_margin = 0.02 m and softplus_beta = 50,
+    # the hinge is already ~indistinguishable from a hard ReLU at 1 mm.
+    softplus_beta: float = 50.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,6 +199,7 @@ class FKCConfig:
     # --- Sub-configs ---------------------------------------------------------
     fk: FKConfig = dataclasses.field(default_factory=FKConfig)
     cost: CostConfig = dataclasses.field(default_factory=CostConfig)
+    collision: CollisionConfig = dataclasses.field(default_factory=CollisionConfig)
     dynamics: DynamicsConfig = dataclasses.field(default_factory=DynamicsConfig)
 
 
@@ -194,6 +225,7 @@ def load_fkc_config(path: str | pathlib.Path) -> FKCConfig:
 
     fk_raw = dict(raw.pop("fk", {}) or {})
     cost_raw = dict(raw.pop("cost", {}) or {})
+    collision_raw = dict(raw.pop("collision", {}) or {})
     dyn_raw = dict(raw.pop("dynamics", {}) or {})
 
     for key in ("base_xyz", "ee_offset_xyz"):
@@ -204,11 +236,12 @@ def load_fkc_config(path: str | pathlib.Path) -> FKCConfig:
             fk_raw[key] = _coerce_tuple(fk_raw[key], 4)
     fk = FKConfig(**fk_raw)
 
-    for key in ("target_xyz", "box_min_xyz", "box_max_xyz"):
-        if key in cost_raw:
-            cost_raw[key] = _coerce_tuple(cost_raw[key], 3)
+    if "target_xyz" in cost_raw:
+        cost_raw["target_xyz"] = _coerce_tuple(cost_raw["target_xyz"], 3)
     cost = CostConfig(**cost_raw)
+
+    collision = CollisionConfig(**collision_raw)
 
     dynamics = DynamicsConfig(**dyn_raw)
 
-    return FKCConfig(fk=fk, cost=cost, dynamics=dynamics, **raw)
+    return FKCConfig(fk=fk, cost=cost, collision=collision, dynamics=dynamics, **raw)
