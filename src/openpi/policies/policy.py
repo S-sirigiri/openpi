@@ -166,7 +166,7 @@ class Policy(BasePolicy):
             "base_world_T": base_world_T,
             "ee_offset_T": ee_offset_T,
             "target_xyz": jnp.asarray(fkc_config.cost.target_xyz, dtype=jnp.float32),
-            "default_safety_margin": jnp.asarray(fkc_config.collision.safety_margin, dtype=jnp.float32),
+            "safety_margin": jnp.asarray(fkc_config.collision.safety_margin, dtype=jnp.float32),
             "softplus_beta": jnp.asarray(fkc_config.collision.softplus_beta, dtype=jnp.float32),
         }
 
@@ -205,12 +205,9 @@ class Policy(BasePolicy):
             )
         sdf_origin = jnp.asarray(fkc_extras["sdf_origin"], dtype=jnp.float32)
         sdf_voxel_size = jnp.asarray(fkc_extras["sdf_voxel_size"], dtype=jnp.float32).reshape(())
-        # Optional per-replan override of the safety margin (e.g., shrink it
-        # during fine-grained placement). Falls back to the static config value.
-        safety_margin = jnp.asarray(
-            fkc_extras.get("safety_margin", static["default_safety_margin"]),
-            dtype=jnp.float32,
-        ).reshape(())
+        # ``safety_margin`` and ``softplus_beta`` come from the YAML
+        # (FKCConfig.collision.*) — never from the wire. The YAML is
+        # authoritative; tweak it there if you need a different value.
         return _fkc_cc.FKRuntime(
             action_mean_7=static["action_mean_7"],
             action_std_7=static["action_std_7"],
@@ -222,7 +219,7 @@ class Policy(BasePolicy):
             sdf_grid=sdf_grid,
             sdf_origin=sdf_origin,
             sdf_voxel_size=sdf_voxel_size,
-            safety_margin=safety_margin,
+            safety_margin=static["safety_margin"],
             softplus_beta=static["softplus_beta"],
         )
 

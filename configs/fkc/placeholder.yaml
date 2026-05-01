@@ -13,8 +13,9 @@
 #   obs["fkc/sdf_grid"]      : float16/float32 array (Nx, Ny, Nz)
 #   obs["fkc/sdf_origin"]    : float32 (3,) world-frame voxel-(0,0,0) origin
 #   obs["fkc/sdf_voxel_size"]: float32 scalar, edge length in metres
-#   obs["fkc/safety_margin"] : float32 scalar (optional override)
 # RoboLab's nvblox sidecar (`.venv_nvblox_sidecar`) is the canonical producer.
+# `safety_margin` and `softplus_beta` are NOT sent over the wire — this YAML
+# is authoritative for them; see `collision:` below.
 #
 # Change `mode` to switch between guidance schemes. When omitted (or
 # `mode: vanilla`) the server behaves identically to baseline pi0.5 and the
