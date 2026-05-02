@@ -156,13 +156,22 @@ def _sdf_trilinear(
     return c0 * (1 - fz) + c1 * fz
 
 
-def _sdf_collision_penalty(world_collision_path: jnp.ndarray, rt: FKRuntime) -> jnp.ndarray:
-    """Softplus-smoothed hinge over ``safety_margin - sdf(p)`` for every point.
+def _sdf_collision_penalty(
+    world_collision_path: jnp.ndarray,
+    rt: FKRuntime,
+    penalty_type: str,
+) -> jnp.ndarray:
+    """Hinge penalty over ``safety_margin - sdf(p)`` for every point.
+
+    The ``penalty_type`` argument selects the hinge formula. It is a Python
+    string consumed at trace time, so JAX compiles only the chosen branch.
 
     Args:
         world_collision_path: ``(B, H, P, 3)`` world-frame collision-sample
             points along the predicted arm trajectory.
         rt: runtime carrying the SDF grid + origin + voxel_size + margin.
+        penalty_type: one of ``softplus`` | ``linear`` | ``squared_hinge`` |
+            ``squared_distance_hinge``. See ``CollisionConfig`` for formulas.
 
     Returns:
         ``(B,)`` sum of point-wise penalties across all H horizon steps and
@@ -171,11 +180,33 @@ def _sdf_collision_penalty(world_collision_path: jnp.ndarray, rt: FKRuntime) -> 
     sdf_values = _sdf_trilinear(
         rt.sdf_grid, rt.sdf_origin, rt.sdf_voxel_size, world_collision_path
     )  # (B, H, P)
-    excess = rt.safety_margin - sdf_values
-    # softplus(beta * x) / beta — smooth max(0, x) hinge.
-    beta = rt.softplus_beta
-    penalty = jnn.softplus(beta * excess) / beta
-    return jnp.sum(penalty, axis=(-2, -1))  # (B,)
+    margin = rt.safety_margin
+    excess = margin - sdf_values  # >0 inside the unsafe band
+
+    if penalty_type == "softplus":
+        # softplus(beta * x) / beta — smooth max(0, x) hinge. Leaks above margin.
+        beta = rt.softplus_beta
+        per_point = jnn.softplus(beta * excess) / beta
+    elif penalty_type == "linear":
+        # Hard ReLU hinge on the violation magnitude.
+        per_point = jnp.maximum(excess, 0.0)
+    elif penalty_type == "squared_hinge":
+        # Squared violation magnitude. Smooth at the boundary, hard cutoff
+        # above it.
+        per_point = jnp.square(jnp.maximum(excess, 0.0))
+    elif penalty_type == "squared_distance_hinge":
+        # max(0, m^2 - sdf^2). Mirrors the cylinder-avoidance pattern that
+        # squares both quantities before hinging. nvblox's ESDF reports
+        # obstacle interiors as small/negative, so squaring still yields a
+        # well-ordered violation here.
+        per_point = jnp.maximum(jnp.square(margin) - jnp.square(sdf_values), 0.0)
+    else:
+        raise ValueError(
+            f"unknown collision.penalty_type: {penalty_type!r} (expected "
+            "softplus | linear | squared_hinge | squared_distance_hinge)"
+        )
+
+    return jnp.sum(per_point, axis=(-2, -1))  # (B,)
 
 
 def _weighted_objective(
@@ -203,7 +234,9 @@ def _weighted_objective(
     )
     cost_term = w_cost * _L_zero(path, rt)
     eq_term = w_eq * jnp.sum(jnp.square(_h_eq(path, rt)), axis=-1)
-    ineq_term = w_ineq * _sdf_collision_penalty(path, rt)
+    ineq_term = w_ineq * _sdf_collision_penalty(
+        path, rt, fkc_cfg.collision.penalty_type
+    )
     return cost_term + eq_term + ineq_term
 
 

@@ -84,16 +84,26 @@ fk:
 #   - ee_plus_arm   : EE + 3 gripper points + arm_sample_points. Default.
 #   - full          : EE + 3 gripper points + full_body_points. Most accurate.
 #
-# `safety_margin` is the SDF threshold below which the hinge fires (metres).
+# `penalty_type` selects the hinge formula applied to (safety_margin - sdf).
+# `safety_margin` (m) is honoured by all four formulas; tune to set the
+# clearance threshold. `softplus_beta` is only consulted when
+# penalty_type == softplus.
+#   - softplus               : softplus(softplus_beta * (m - sdf)) / softplus_beta
+#                              Smooth, leaks above the margin. Best gradients.
+#   - linear                 : max(0, m - sdf)        — ReLU hinge on violation.
+#   - squared_hinge          : max(0, m - sdf)^2      — squared violation.
+#   - squared_distance_hinge : max(0, m^2 - sdf^2)    — cylinder-style.
+#
 # 2 cm is a reasonable starting clearance for the Franka + Robotiq pair on a
 # tabletop. Tune down if it prevents close-approach grasps; tune up if the
 # robot is brushing obstacles.
 collision:
   mode: ee_plus_arm
-  safety_margin: 0.02
+  penalty_type: squared_hinge  # softplus | linear | squared_hinge | squared_distance_hinge
+  safety_margin: 0.0     # tunable for ALL penalty_types
   arm_sample_points: 8
   full_body_points: 30
-  softplus_beta: 50.0
+  softplus_beta: 50.0     # only used when penalty_type == softplus
 
 # Mini physics simulator. ``enabled: true`` rolls each chunk through Isaac
 # Lab's implicit-PD law so the constraint sees the trajectory the simulator

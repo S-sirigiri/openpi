@@ -84,13 +84,24 @@ class CostConfig:
 class CollisionConfig:
     """SDF-based collision-avoidance constraint parameters.
 
-    The constraint is a softplus-smoothed hinge: for every collision sample
-    point ``p`` along the predicted arm trajectory, penalty is
-    ``softplus(softplus_beta * (safety_margin - sdf(p))) / softplus_beta``.
+    For every collision sample point ``p`` along the predicted arm trajectory
+    the penalty is one of four hinge formulas applied to ``(safety_margin -
+    sdf(p))``, selected by ``penalty_type``:
+
+      - ``softplus``               : ``softplus(softplus_beta * (m - sdf)) / softplus_beta``
+                                    (smooth approximation; leaks above the margin)
+      - ``linear``                 : ``max(0, m - sdf)``  (hard ReLU hinge)
+      - ``squared_hinge``          : ``max(0, m - sdf)^2`` (squared violation magnitude)
+      - ``squared_distance_hinge`` : ``max(0, m^2 - sdf^2)`` (cylinder-style; squares
+                                    the distances themselves before hinging)
+
+    ``safety_margin`` is honoured by all four formulas. ``softplus_beta`` is
+    only consulted by the ``softplus`` branch.
 
     The SDF itself is provided per ``Policy.infer`` call via ``fkc_extras``
     (built by RoboLab's nvblox sidecar) and lives on the ``FKRuntime``. Only
-    the static knobs (mode, margin, sample counts, sharpness) belong here.
+    the static knobs (mode, margin, sample counts, sharpness, penalty_type)
+    belong here.
     """
 
     # Which body points to query against the SDF. Static at JIT trace time.
@@ -100,10 +111,17 @@ class CollisionConfig:
     #   - "full": EE + 3 gripper points + ``full_body_points`` along the arm.
     mode: Literal["ee_only", "ee_plus_arm", "full"] = "ee_plus_arm"
 
+    # Penalty formula applied to (safety_margin - sdf). See class docstring
+    # for the exact form of each option. Static at JIT trace time.
+    penalty_type: Literal[
+        "softplus", "linear", "squared_hinge", "squared_distance_hinge"
+    ] = "softplus"
+
     # Distance (metres) below which the penalty starts firing. With nvblox's
     # ESDF using positive-outside-the-obstacle convention, we penalise points
     # whose ``sdf < safety_margin``. 2 cm is a reasonable starting clearance
-    # for the Franka + Robotiq pair on a tabletop.
+    # for the Franka + Robotiq pair on a tabletop. Tunable for all penalty
+    # types.
     safety_margin: float = 0.02
 
     # Number of arm-polyline samples used in ``ee_plus_arm`` mode.
@@ -114,7 +132,8 @@ class CollisionConfig:
 
     # Softplus sharpness for the hinge — higher = closer to ReLU, smoother
     # near the boundary. With safety_margin = 0.02 m and softplus_beta = 50,
-    # the hinge is already ~indistinguishable from a hard ReLU at 1 mm.
+    # the hinge is already ~indistinguishable from a hard ReLU at 1 mm. Only
+    # consulted when ``penalty_type == "softplus"``.
     softplus_beta: float = 50.0
 
 
